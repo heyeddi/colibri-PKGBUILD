@@ -1,0 +1,106 @@
+name: Update AUR package
+
+on:
+  schedule:
+    # Every 6 hours, offset past the hour to avoid thundering herds
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-aur
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Find latest release
+        id: find
+        run: |
+          chmod +x find_release.sh test
+          ./find_release.sh
+          if [ ! -f build.env ]; then
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # shellcheck disable=SC1091
+          source build.env
+          echo "has_update=true" >> "$GITHUB_OUTPUT"
+          echo "pkgver=${pkgver}" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version
+        if: steps.find.outputs.has_update == 'true'
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.find.outputs.pkgver }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+
+      - name: Update checksums and verify package
+        if: steps.find.outputs.has_update == 'true'
+        run: |
+          docker run --rm \
+            -v "$PWD:/pkg" -w /pkg \
+            archlinux:base-devel \
+            bash -ec '
+              pacman -Syu --noconfirm --needed base-devel git sudo
+              useradd -m builduser
+              echo "builduser ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+              chown -R builduser:builduser /pkg
+              su builduser -c "./test"
+            '
+
+      - name: Publish to AUR
+        if: steps.find.outputs.has_update == 'true'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          printf '%s\n' \
+            'Host aur.archlinux.org' \
+            '  IdentityFile ~/.ssh/aur' \
+            '  IdentitiesOnly yes' > ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          git config --global user.email "zomundo@gmail.com"
+          git config --global user.name "Mundo"
+
+          # Commit only packaging metadata onto AUR master
+          work=$(mktemp -d)
+          git clone --branch master "ssh://aur@aur.archlinux.org/colibri-bin.git" "$work"
+          cp PKGBUILD .SRCINFO "$work/"
+          cd "$work"
+          git add PKGBUILD .SRCINFO
+          pk_name=$(grep -Po "^pkgname=\K.*" PKGBUILD)
+          pk_ver=$(grep -Po "^pkgver=\K.*" PKGBUILD)
+          pk_rel=$(grep -Po "^pkgrel=\K.*" PKGBUILD)
+          commit_msg="update to $pk_name ver $pk_ver, rel version $pk_rel"
+          git commit -m "$commit_msg"
+          git push origin master
+
+      - name: Commit back to GitHub
+        if: steps.find.outputs.has_update == 'true'
+        run: |
+          set -euo pipefail
+          git config user.email "zomundo@gmail.com"
+          git config user.name "Mundo"
+          git add PKGBUILD .SRCINFO
+          pk_name=$(grep -Po "^pkgname=\K.*" PKGBUILD)
+          pk_ver=$(grep -Po "^pkgver=\K.*" PKGBUILD)
+          pk_rel=$(grep -Po "^pkgrel=\K.*" PKGBUILD)
+          commit_msg="update to $pk_name ver $pk_ver, rel version $pk_rel"
+          git commit -m "$commit_msg"
+          git push origin main
